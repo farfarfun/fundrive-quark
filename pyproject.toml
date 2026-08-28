@@ -3,7 +3,7 @@ name = "fundrive-quark"
 version = "1.0.3"
 description = "fundrive-quark"
 readme = "README.md"
-requires-python = ">=3.8"
+requires-python = ">=3.10"
 dependencies = [ "funutil>=1.0.46",]
 [[project.authors]]
 name = "niuliangtao"

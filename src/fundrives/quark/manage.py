@@ -53,7 +53,7 @@ def safe_copy(src: str, dst: str) -> None:
     try:
         shutil.copy(src, dst)
         logger.info(f"文件已复制到：{dst}")
-    except Exception as e:
+    except OSError as e:
         logger.error(f"备份 share_url.txt 文件错误：{e}")
 
 
@@ -70,9 +70,7 @@ def generate_random_code(length: int = 4) -> str:
     return "".join(random.choice(characters) for _ in range(length))
 
 
-def get_datetime(
-    timestamp: float | None = None, fmt: str = "%Y-%m-%d %H:%M:%S"
-) -> str:
+def get_datetime(timestamp: float | None = None, fmt: str = "%Y-%m-%d %H:%M:%S") -> str:
     """将时间戳格式化为字符串，未传入时间戳时使用当前时间。
 
     参数:
@@ -83,8 +81,8 @@ def get_datetime(
         格式化后的时间字符串。
     """
     if timestamp is None or not isinstance(timestamp, (int, float)):
-        return datetime.today().strftime(fmt)
-    return datetime.fromtimestamp(timestamp).strftime(fmt)
+        return datetime.now().astimezone().strftime(fmt)
+    return datetime.fromtimestamp(timestamp).astimezone().strftime(fmt)
 
 
 def _mask_share_url(url: str) -> str:
@@ -189,11 +187,11 @@ class QuarkPanManage:
         return requests.request(
             method,
             url,
+            *args,
             params=params,
             headers=headers or self.headers,
             json=data,
             timeout=timeout,
-            *args,
             **kwargs,
         ).json()
 
@@ -271,9 +269,7 @@ class QuarkPanManage:
                         "file_type": file["file_type"],
                         "dir": file["dir"],
                         "pdir_fid": file["pdir_fid"],
-                        "include_items": file["include_items"]
-                        if "include_items" in file
-                        else "",
+                        "include_items": file.get("include_items", ""),
                         "share_fid_token": file["share_fid_token"],
                         "status": file["status"],
                     }
@@ -388,7 +384,7 @@ class QuarkPanManage:
             return None
         elif data_list:
             logger.info("文件下载地址列表获取成功")
-        return data_list[0]["download_url"]
+        return data_list[0]["download_url"] if data_list else None
 
     def get_share_save_task_id(
         self,
@@ -420,8 +416,7 @@ class QuarkPanManage:
             "scene": "link",
         }
 
-        response = self.request("share/sharepage/save", "post", data=data)
-        json_data = response.json()
+        json_data = self.request("share/sharepage/save", "post", data=data)
         task_id = json_data["data"]["task_id"]
         logger.info(f"获取任务ID：{task_id}")
         return task_id
@@ -630,7 +625,7 @@ class QuarkPanManage:
                                     share_success = True
                                     break
 
-                                except Exception as e:
+                                except Exception as e:  # noqa: BLE001 - retry individual share
                                     share_error_msg = e
                                     error += 1
 
@@ -639,7 +634,9 @@ class QuarkPanManage:
                                     logger.error(
                                         f"{error}.{first_dir}/{second_dir} 文件夹"
                                     )
-                                    logger.error(f"{n} | {first_dir} | {second_dir} | {fid}")
+                                    logger.error(
+                                        f"{n} | {first_dir} | {second_dir} | {fid}"
+                                    )
 
                         second_total = json_data2["metadata"]["_total"]
                         second_size = json_data2["metadata"]["_size"]
@@ -656,7 +653,7 @@ class QuarkPanManage:
                 first_page += 1
             logger.info(f"总共分享了 {n} 个文件夹")
 
-        except Exception as e:
+        except Exception as e:  # noqa: BLE001 - preserve batch processing behavior
             logger.error(f"分享失败：{e}")
             logger.error(f"{first_dir}/{second_dir} 文件夹")
 
@@ -706,7 +703,7 @@ class QuarkPanManage:
                         logger.info(f"{n}.分享成功 {first_dir}/{second_dir} 文件夹")
                         share_success = True
                         break
-                    except Exception as e:
+                    except Exception as e:  # noqa: BLE001 - retry individual share
                         logger.error(f"分享失败：{e}")
                         error += 1
 
@@ -797,7 +794,7 @@ class QuarkPanManage:
         pwd_id = get_id_from_url(url)
         stoken = self.get_stoken(pwd_id)
         detail = self.get_detail(pwd_id, stoken)[1][0]
-        file_name = detail.get("title")
+        file_name = detail.get("title") or detail.get("file_name", "")
 
         first_id, share_fid_token, file_type = (
             detail.get("fid"),
@@ -846,8 +843,7 @@ class QuarkPanManage:
             "pdir_fid": "0",
             "scene": "link",
         }
-        response = self.request("share/sharepage/save", "POST", data=data)
-        json_data = response.json()
+        json_data = self.request("share/sharepage/save", "POST", data=data)
         task_id = json_data.get("data").get("task_id")
         logger.debug(f"获取到转存任务ID：{task_id}")
         return task_id

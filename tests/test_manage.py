@@ -202,3 +202,114 @@ def test_get_file_list_builds_expected_params():
     assert kwargs["params"]["pdir_fid"] == "0"
     assert kwargs["params"]["_page"] == 2
     assert kwargs["params"]["_size"] == 10
+
+
+def test_get_user_info_uses_authenticated_request():
+    drive = _make_manage()
+    response = mock.Mock()
+    response.json.return_value = {"data": {"nickname": "tester"}}
+    with mock.patch(
+        "fundrives.quark.manage.requests.get", return_value=response
+    ) as get:
+        assert drive.get_user_info() == {"data": {"nickname": "tester"}}
+    get.assert_called_once()
+
+
+def test_create_dir_sends_parent_and_name():
+    drive = _make_manage()
+    with mock.patch.object(drive, "request", return_value={"status": 200}) as request:
+        assert drive.create_dir("docs", "parent") == {"status": 200}
+    request.assert_called_once_with(
+        "file",
+        "post",
+        data={
+            "pdir_fid": "parent",
+            "file_name": "docs",
+            "dir_path": "",
+            "dir_init_lock": False,
+        },
+    )
+
+
+def test_search_file_builds_search_params():
+    drive = _make_manage()
+    with mock.patch.object(drive, "request", return_value={"data": []}) as request:
+        drive.search_file("report", page=2, size=10)
+    assert request.call_args.args[0] == "file/search"
+    assert request.call_args.kwargs["params"] == {
+        "q": "report",
+        "_page": 2,
+        "_size": 10,
+        "_sort": "file_type:desc,updated_at:desc",
+        "_fetch_total": 1,
+        "_is_hl": "1",
+    }
+
+
+def test_del_file_sends_file_id():
+    drive = _make_manage()
+    with mock.patch.object(drive, "request", return_value={"status": 200}) as request:
+        assert drive.del_file("fid") == {"status": 200}
+    request.assert_called_once_with(
+        "file/delete",
+        "post",
+        data={"action_type": 2, "filelist": ["fid"], "exclude_fids": []},
+    )
+
+
+def test_get_share_save_task_id_accepts_json_request_result():
+    drive = _make_manage()
+    with mock.patch.object(
+        drive, "request", return_value={"data": {"task_id": "task-1"}}
+    ) as request:
+        assert (
+            drive.get_share_save_task_id("pwd", "token", ["fid"], ["share-token"])
+            == "task-1"
+        )
+    assert request.call_args.args[0] == "share/sharepage/save"
+
+
+def test_save_task_id_accepts_json_request_result():
+    drive = _make_manage()
+    with mock.patch.object(
+        drive, "request", return_value={"data": {"task_id": "task-1"}}
+    ):
+        assert drive.save_task_id("pwd", "token", "fid", "share-token") == "task-1"
+
+
+def test_task_returns_completed_response_and_stops_polling():
+    drive = _make_manage()
+    result = {"data": {"status": 2}}
+    with mock.patch.object(drive, "request", return_value=result) as request:
+        assert drive.task("task-1") == result
+    request.assert_called_once()
+
+
+def test_task_returns_false_after_retry_limit():
+    drive = _make_manage()
+    with mock.patch.object(
+        drive, "request", return_value={"data": {"status": 0}}
+    ) as request:
+        assert drive.task("task-1", trice=2) is False
+    assert request.call_count == 2
+
+
+def test_share_task_id_and_result_helpers():
+    drive = _make_manage()
+    response = mock.Mock()
+    response.json.return_value = {"data": {"share_url": "https://pan.quark.cn/s/abc"}}
+    with (
+        mock.patch.object(
+            drive,
+            "request",
+            side_effect=[
+                {"data": {"task_id": "task-1"}},
+                {"data": {"share_id": "share-1"}},
+            ],
+        ),
+        mock.patch("fundrives.quark.manage.requests.post", return_value=response),
+    ):
+        task_id = drive.share_task_id("fid", "name")
+        assert task_id == "task-1"
+        assert drive.get_share_id(task_id) == "share-1"
+        assert drive.get_share_link("share-1") == "https://pan.quark.cn/s/abc"

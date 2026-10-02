@@ -6,27 +6,38 @@
 
 ## 安装
 
+本包尚未发布到 PyPI，目前从仓库安装：
+
 ```bash
-pip install fundrive-quark
+pip install git+https://github.com/farfarfun/fundrive-quark.git
 # 或
-uv add fundrive-quark
+uv add git+https://github.com/farfarfun/fundrive-quark.git
 ```
 
 ## 快速开始
 
 ```python
-from fundrives.quark.manage import QuarkPanManage
+from fundrives.quark import QuarkPanError, QuarkPanManage
 
 # cookies 为已登录夸克网盘账号的浏览器 Cookie 字符串
 drive = QuarkPanManage(cookies="your-cookie-string")
 
 # 将他人分享的文件转存到自己网盘的根目录
-drive.save_shared("https://pan.quark.cn/s/xxxxxxxx", folder_id="0")
+# 返回 True 表示转存任务确实完成，False 表示被跳过（网盘中已存在、分享为空等）
+saved = drive.save_shared("https://pan.quark.cn/s/xxxxxxxx", folder_id="0")
 
 # 列出根目录文件
 file_list = drive.get_file_list(pdir_fid="0")
 for item in file_list["data"]["list"]:
     print(item["file_name"])
+
+# 批量分享：返回失败条目，可直接喂回 share_retry 重试
+try:
+    failed = drive.share("https://pan.quark.cn/list/#/all-0")
+    if failed:
+        drive.share_retry("\n".join(failed))
+except QuarkPanError as e:
+    print(f"批量分享中断：{e}")
 ```
 
 ## 主要能力
@@ -34,6 +45,14 @@ for item in file_list["data"]["list"]:
 - 分享链接解析、转存（单文件 `store`、批量 `save_shared`）
 - 文件/文件夹列表、搜索、删除、新建目录
 - 文件夹批量分享（`share`/`share_retry`），支持提取码与失败重试
+
+## 返回值与异常约定
+
+- 「跳过」用返回值表达（`save_shared` 返回 `False`、`safe_copy` 返回 `False`、
+  `share`/`share_retry` 返回失败条目列表），调用方据此判断是否真的做了事。
+- 「失败」一律抛异常：接口返回非 JSON、异步任务轮询超时、分页超过上限等都抛
+  `QuarkPanError`，异常信息带接口路径 / task_id / 目录等上下文；网络层错误直接
+  透出 `requests.RequestException`。不会出现「记一条日志后装作成功」的情况。
 
 ---
 

@@ -18,6 +18,30 @@ from farlog import getLogger
 
 logger = getLogger("fundrive")
 
+#: `get_detail` 分页的硬上限，超过视为接口异常或调用参数有误。
+MAX_DETAIL_PAGES = 100
+
+#: 单个文件夹分享的最大尝试次数。
+SHARE_ATTEMPTS = 3
+
+#: `task` 接口中代表「任务已完成」的 status 值。
+TASK_STATUS_DONE = 2
+
+
+class QuarkPanError(RuntimeError):
+    """夸克网盘接口调用失败时抛出的领域异常。"""
+
+
+#: 批量流程中可以重试/跳过的错误：网络层失败、非 JSON 响应、响应结构缺字段。
+#: 故意**不含** `Exception`，这样 `TypeError`/`AttributeError` 这类编程错误会
+#: 直接冒出来，而不是被重试循环当成「接口不稳定」反复吞掉。
+RECOVERABLE_API_ERRORS = (
+    requests.RequestException,
+    QuarkPanError,
+    KeyError,
+    IndexError,
+)
+
 
 def get_id_from_url(url: str) -> str:
     """从夸克分享链接中提取 pwd_id。
@@ -35,26 +59,31 @@ def get_id_from_url(url: str) -> str:
     return ""
 
 
-def safe_copy(src: str, dst: str) -> None:
+def safe_copy(src: str, dst: str) -> bool:
     """安全复制文件：源文件不存在则跳过，目标已存在则先删除再复制。
 
     参数:
         src: 源文件路径。
         dst: 目标文件路径。
+
+    返回:
+        `True` 表示复制完成；`False` 表示源文件不存在、已跳过。
+
+    异常:
+        OSError: 复制过程本身失败（权限、磁盘空间等）时原样抛出，
+            调用方必须能区分「跳过」和「失败」。
     """
     if not os.path.exists(src):
         logger.warning(f"源文件不存在，跳过复制：{src}")
-        return
+        return False
 
     if os.path.exists(dst):
         os.remove(dst)
         logger.info(f"目标文件已存在，已删除：{dst}")
 
-    try:
-        shutil.copy(src, dst)
-        logger.info(f"文件已复制到：{dst}")
-    except OSError as e:
-        logger.error(f"备份 share_url.txt 文件错误：{e}")
+    shutil.copy(src, dst)
+    logger.info(f"文件已复制到：{dst}")
+    return True
 
 
 def generate_random_code(length: int = 4) -> str:
@@ -172,6 +201,11 @@ class QuarkPanManage:
 
         返回:
             接口返回的 JSON 反序列化结果。
+
+        异常:
+            requests.RequestException: 网络层失败（连接、超时等）。
+            QuarkPanError: 响应体不是合法 JSON（典型为网关错误页），
+                异常信息中带上接口路径、HTTP 状态码与响应片段。
         """
         url = f"{self.base_url}/{uri}"
         params = params or {}
@@ -184,7 +218,7 @@ class QuarkPanManage:
                 "__t": int(time.time()) * 1000,
             }
         )
-        return requests.request(
+        response = requests.request(
             method,
             url,
             *args,
@@ -193,7 +227,35 @@ class QuarkPanManage:
             json=data,
             timeout=timeout,
             **kwargs,
-        ).json()
+        )
+        return self._parse_json(response, uri)
+
+    @staticmethod
+    def _parse_json(response: requests.Response, uri: str) -> Any:
+        """解析响应 JSON，失败时抛出带上下文的 `QuarkPanError`。
+
+        夸克的业务错误是以 HTTP 200 + JSON 里的 `status`/`code` 返回的，
+        因此这里不做 `raise_for_status`，只在响应根本不是 JSON（网关错误页、
+        限流拦截页）时转换成领域异常，避免调用方只拿到一句
+        `Expecting value: line 1 column 1`。
+
+        参数:
+            response: `requests` 的响应对象。
+            uri: 发起请求的接口路径，用于异常上下文。
+
+        返回:
+            响应体的 JSON 反序列化结果。
+
+        异常:
+            QuarkPanError: 响应体不是合法 JSON。
+        """
+        try:
+            return response.json()
+        except ValueError as e:
+            snippet = (response.text or "")[:200]
+            raise QuarkPanError(
+                f"接口 {uri} 返回了非 JSON 响应（HTTP {response.status_code}）：{snippet!r}"
+            ) from e
 
     def get_stoken(self, pwd_id: str) -> str:
         """获取分享链接对应的 stoken，用于后续访问分享详情与转存。
@@ -237,9 +299,13 @@ class QuarkPanManage:
         返回:
             `(is_owner, file_list)` 二元组：`is_owner` 表示当前账号是否已拥有
             该分享内容，`file_list` 为文件/文件夹信息列表。
+
+        异常:
+            QuarkPanError: 翻到 `MAX_DETAIL_PAGES` 页仍未取完，说明接口分页
+                元数据异常。此时宁可报错，也不能静默返回截断的列表或 `None`。
         """
         file_list: list[dict[str, int | str]] = []
-        for page in range(1, 100):
+        for page in range(1, MAX_DETAIL_PAGES):
             params = {
                 "pwd_id": pwd_id,
                 "stoken": stoken,
@@ -277,8 +343,17 @@ class QuarkPanManage:
             if _total <= _size or _count < _size:
                 return is_owner, file_list
 
-    def get_user_info(self) -> Any:
+        raise QuarkPanError(
+            f"分享详情分页超过上限 {MAX_DETAIL_PAGES - 1} 页仍未取完"
+            f"（pwd_id={pwd_id} pdir_fid={pdir_fid} 已取 {len(file_list)} 条），"
+            "疑似接口分页元数据异常"
+        )
+
+    def get_user_info(self, timeout: int = 10) -> Any:
         """获取当前登录账号的用户信息。
+
+        参数:
+            timeout: 请求超时时间（秒）。
 
         返回:
             接口返回的用户信息 JSON。
@@ -287,9 +362,13 @@ class QuarkPanManage:
             "fr": "pc",
             "platform": "pc",
         }
-        return requests.get(
-            "https://pan.quark.cn/account/info", params=params, headers=self.headers
-        ).json()
+        response = requests.get(
+            "https://pan.quark.cn/account/info",
+            params=params,
+            headers=self.headers,
+            timeout=timeout,
+        )
+        return self._parse_json(response, "account/info")
 
     def create_dir(self, pdir_name: str = "新建文件夹", pdir_fid: str = "") -> Any:
         """创建文件夹。
@@ -313,18 +392,26 @@ class QuarkPanManage:
         self,
         share_url: str,
         folder_id: str | None = None,
-    ) -> None:
+    ) -> bool:
         """将他人分享的文件/文件夹转存到自己网盘的指定目录。
 
         参数:
             share_url: 待转存的分享链接。
             folder_id: 目标目录 ID；为空时会跳过转存并提示重新获取。
+
+        返回:
+            `True` 表示转存任务已成功完成；`False` 表示被跳过（stoken 获取失败、
+            分享内容为空、未指定目标目录、网盘中已存在该内容）。调用方据此判断
+            是否真的转存过，不要只看有没有抛异常。
+
+        异常:
+            QuarkPanError: 转存任务提交后未在轮询次数内完成。
         """
         logger.info(f"文件分享链接：{_mask_share_url(share_url)}")
         pwd_id = self.get_pwd_id(share_url)
         stoken = self.get_stoken(pwd_id)
         if not stoken:
-            return
+            return False
         is_owner, data_list = self.get_detail(pwd_id, stoken)
         files_count = 0
         folders_count = 0
@@ -332,39 +419,43 @@ class QuarkPanManage:
         folders_list: list[str] = []
         files_id_list = []
 
-        if data_list:
-            total_files_count = len(data_list)
-            for data in data_list:
-                if data["dir"]:
-                    folders_count += 1
-                    folders_list.append(data["file_name"])
-                else:
-                    files_count += 1
-                    files_list.append(data["file_name"])
-                    files_id_list.append((data["fid"], data["file_name"]))
+        if not data_list:
+            logger.info("分享内容为空，无需转存")
+            return False
 
+        total_files_count = len(data_list)
+        for data in data_list:
+            if data["dir"]:
+                folders_count += 1
+                folders_list.append(data["file_name"])
+            else:
+                files_count += 1
+                files_list.append(data["file_name"])
+                files_id_list.append((data["fid"], data["file_name"]))
+
+        logger.info(
+            f"转存总数：{total_files_count}，文件数：{files_count}，文件夹数：{folders_count} | 支持嵌套"
+        )
+        logger.info(f"文件转存列表：{files_list}")
+        logger.info(f"文件夹转存列表：{folders_list}")
+
+        fid_list = [i["fid"] for i in data_list]
+        share_fid_token_list = [i["share_fid_token"] for i in data_list]
+
+        if not folder_id:
             logger.info(
-                f"转存总数：{total_files_count}，文件数：{files_count}，文件夹数：{folders_count} | 支持嵌套"
+                "保存目录ID不合法，请重新获取，如果无法获取，请输入0作为文件夹ID"
             )
-            logger.info(f"文件转存列表：{files_list}")
-            logger.info(f"文件夹转存列表：{folders_list}")
+            return False
 
-            fid_list = [i["fid"] for i in data_list]
-            share_fid_token_list = [i["share_fid_token"] for i in data_list]
-
-            if not folder_id:
-                logger.info(
-                    "保存目录ID不合法，请重新获取，如果无法获取，请输入0作为文件夹ID"
-                )
-                return
-
-            if is_owner == 1:
-                logger.info("网盘中已经存在该文件，无需再次转存")
-                return
-            task_id = self.get_share_save_task_id(
-                pwd_id, stoken, fid_list, share_fid_token_list, to_pdir_fid=folder_id
-            )
-            self.submit_task(task_id)
+        if is_owner == 1:
+            logger.info("网盘中已经存在该文件，无需再次转存")
+            return False
+        task_id = self.get_share_save_task_id(
+            pwd_id, stoken, fid_list, share_fid_token_list, to_pdir_fid=folder_id
+        )
+        self.submit_task(task_id)
+        return True
 
     def get_file_download_url(self, fid: str) -> str | None:
         """获取文件的下载直链。
@@ -382,7 +473,7 @@ class QuarkPanManage:
         if json_data["status"] != 200:
             logger.error(f"文件下载地址列表获取失败，{json_data['message']}")
             return None
-        elif data_list:
+        if data_list:
             logger.info("文件下载地址列表获取成功")
         return data_list[0]["download_url"] if data_list else None
 
@@ -421,9 +512,7 @@ class QuarkPanManage:
         logger.info(f"获取任务ID：{task_id}")
         return task_id
 
-    def submit_task(
-        self, task_id: str, retry: int = 50
-    ) -> bool | dict[str, str | dict[str, int | str]] | None:
+    def submit_task(self, task_id: str, retry: int = 50) -> dict[str, Any]:
         """轮询提交异步任务直至完成或达到重试上限。
 
         参数:
@@ -431,8 +520,13 @@ class QuarkPanManage:
             retry: 最大轮询次数，默认 50。
 
         返回:
-            任务完成时返回接口的 JSON 结果；超过重试次数仍未完成则返回 `None`。
+            任务完成时接口返回的 JSON。
+
+        异常:
+            QuarkPanError: 超过重试次数任务仍未完成。此前返回 `None` 会让
+                `save_shared` 这类调用方把「转存失败」当成「转存成功」。
         """
+        last_message = ""
         for i in range(retry):
             # 随机暂停100-50毫秒
             time.sleep(random.randint(500, 1000) / 1000)
@@ -441,6 +535,7 @@ class QuarkPanManage:
             json_data = self.request("task", "get", headers=self.headers, params=params)
 
             if json_data["message"] != "ok":
+                last_message = json_data["message"]
                 if (
                     json_data["code"] == 32003
                     and "capacity limit" in json_data["message"]
@@ -458,7 +553,8 @@ class QuarkPanManage:
                     )
                 continue
 
-            if json_data["data"]["status"] != 2:
+            if json_data["data"]["status"] != TASK_STATUS_DONE:
+                last_message = f"status={json_data['data']['status']}"
                 continue
 
             if json_data["data"]["task_title"] == "分享-转存":
@@ -468,7 +564,10 @@ class QuarkPanManage:
                 )
                 logger.info(f"文件保存位置：{to_pdir_name or '根目录'} 文件夹")
             return json_data
-        return None
+        raise QuarkPanError(
+            f"任务 task_id={task_id} 轮询 {retry} 次后仍未完成"
+            f"（最后一次：{last_message or '无'}）"
+        )
 
     def get_share_task_id(
         self,
@@ -498,8 +597,8 @@ class QuarkPanManage:
         }
         if url_type == 2:
             json_data["passcode"] = password or generate_random_code()
-        json_data = self.request("share", "post", json=json_data)
-        return json_data["data"]["task_id"]
+        response = self.request("share", "post", data=json_data)
+        return response["data"]["task_id"]
 
     def get_share_id(self, task_id: str) -> str:
         """根据分享任务 ID 查询分享结果 ID。
@@ -539,6 +638,57 @@ class QuarkPanManage:
             share_url = share_url + f"?pwd={json_data['data']['passcode']}"
         return share_url
 
+    def _share_folder_with_retry(
+        self,
+        fid: str,
+        title: str,
+        url_type: int,
+        expired_type: int,
+        password: str,
+        attempts: int = SHARE_ATTEMPTS,
+    ) -> str:
+        """为单个文件夹创建分享链接，可恢复错误按次数重试。
+
+        参数:
+            fid: 待分享文件夹 ID。
+            title: 分享标题。
+            url_type: 分享链接类型，`2` 表示带提取码。
+            expired_type: 过期类型。
+            password: 指定提取码，为空时按 `url_type` 自动生成。
+            attempts: 最大尝试次数。
+
+        返回:
+            分享链接。
+
+        异常:
+            QuarkPanError: 重试耗尽仍未成功，异常链上保留最后一次原始错误。
+                注意只有网络/响应格式这类可恢复错误才会重试，编程错误
+                （`TypeError`/`AttributeError` 等）直接向上抛出，不被重试掩盖。
+        """
+        last_error: Exception | None = None
+        for attempt in range(1, attempts + 1):
+            try:
+                time.sleep(random.choice([0.5, 1, 1.5, 2]))
+                task_id = self.get_share_task_id(
+                    fid,
+                    title,
+                    url_type=url_type,
+                    expired_type=expired_type,
+                    password=password,
+                )
+                logger.debug(f"获取到任务ID：{task_id}")
+                share_id = self.get_share_id(task_id)
+                logger.debug(f"获取到分享ID：{share_id}")
+                return self.submit_share(share_id)
+            except RECOVERABLE_API_ERRORS as e:
+                last_error = e
+                logger.warning(
+                    f"第 {attempt}/{attempts} 次分享「{title}」（fid={fid}）失败：{e}"
+                )
+        raise QuarkPanError(
+            f"分享「{title}」（fid={fid}）失败，已重试 {attempts} 次：{last_error}"
+        ) from last_error
+
     def share(
         self,
         share_url: str,
@@ -546,7 +696,7 @@ class QuarkPanManage:
         url_type: int = 1,
         expired_type: int = 2,
         password: str = "",
-    ) -> None:
+    ) -> list[str]:
         """批量分享指定网盘文件夹页面下的二级子文件夹。
 
         遍历 `share_url` 对应目录下的一级、二级子文件夹并逐个创建分享链接。
@@ -557,18 +707,24 @@ class QuarkPanManage:
             url_type: 分享链接类型，`2` 表示带提取码。
             expired_type: 过期类型。
             password: 指定提取码，为空时按 `url_type` 自动生成。
+
+        返回:
+            失败条目列表，每项形如 `序号 | 一级目录 | 二级目录 | 文件夹ID`，
+            可直接作为 `share_retry` 的输入；全部成功时返回空列表。
+
+        异常:
+            QuarkPanError: 目录列表获取失败等无法继续的错误，异常信息中带上
+                当前所在目录；不再静默吞掉让调用方以为已全部分享成功。
         """
+        logger.info(f"文件夹网页地址：{_mask_share_url(share_url)}")
+        pwd_id = share_url.rsplit("/", maxsplit=1)[1].split("-")[0]
+
         first_dir = ""
         second_dir = ""
+        first_page = 1
+        n = 0
+        failures: list[str] = []
         try:
-            logger.info(f"文件夹网页地址：{_mask_share_url(share_url)}")
-            pwd_id = share_url.rsplit("/", maxsplit=1)[1].split("-")[0]
-
-            first_page = 1
-            n = 0
-            error = 0
-            os.makedirs("share", exist_ok=True)
-
             while True:
                 json_data = self.get_file_list(
                     pwd_id, page=first_page, size=50, fetch_total=True
@@ -594,49 +750,27 @@ class QuarkPanManage:
                                 continue
 
                             n += 1
-                            share_success = False
-
-                            fid = ""
-                            share_error_msg: Exception | None = None
-                            for i in range(3):
-                                try:
-                                    second_dir = i2["file_name"]
-                                    logger.info(
-                                        f"{n}.开始分享 {first_dir}/{second_dir} 文件夹"
-                                    )
-                                    random_time = random.choice([0.5, 1, 1.5, 2])
-                                    time.sleep(random_time)
-                                    fid = i2["fid"]
-                                    task_id = self.get_share_task_id(
-                                        fid,
-                                        second_dir,
-                                        url_type=url_type,
-                                        expired_type=expired_type,
-                                        password=password,
-                                    )
-                                    share_id = self.get_share_id(task_id)
-                                    share_url = self.submit_share(share_id)
-                                    logger.info(
-                                        f"{n} | {first_dir} | {second_dir} | {_mask_share_url(share_url)}"
-                                    )
-                                    logger.info(
-                                        f"{n}.分享成功 {first_dir}/{second_dir} 文件夹"
-                                    )
-                                    share_success = True
-                                    break
-
-                                except Exception as e:  # noqa: BLE001 - retry individual share
-                                    share_error_msg = e
-                                    error += 1
-
-                                if not share_success:
-                                    logger.error(f"分享失败：{share_error_msg}")
-                                    logger.error(
-                                        f"{error}.{first_dir}/{second_dir} 文件夹"
-                                    )
-                                    logger.error(
-                                        f"{n} | {first_dir} | {second_dir} | {fid}"
-                                    )
+                            second_dir = i2["file_name"]
+                            fid = i2["fid"]
+                            record = f"{n} | {first_dir} | {second_dir} | {fid}"
+                            logger.info(f"{n}.开始分享 {first_dir}/{second_dir} 文件夹")
+                            try:
+                                share_link = self._share_folder_with_retry(
+                                    fid,
+                                    second_dir,
+                                    url_type=url_type,
+                                    expired_type=expired_type,
+                                    password=password,
+                                )
+                            except QuarkPanError as e:
+                                logger.error(f"分享失败：{e}")
+                                logger.error(record)
+                                failures.append(record)
+                                continue
+                            logger.info(
+                                f"{n} | {first_dir} | {second_dir} | {_mask_share_url(share_link)}"
+                            )
+                            logger.info(f"{n}.分享成功 {first_dir}/{second_dir} 文件夹")
 
                         second_total = json_data2["metadata"]["_total"]
                         second_size = json_data2["metadata"]["_size"]
@@ -645,17 +779,20 @@ class QuarkPanManage:
                             break
                         second_page += 1
 
-                second_total = json_data["metadata"]["_total"]
-                second_size = json_data["metadata"]["_size"]
-                second_page = json_data["metadata"]["_page"]
-                if second_size * second_page >= second_total:
+                total = json_data["metadata"]["_total"]
+                size = json_data["metadata"]["_size"]
+                page = json_data["metadata"]["_page"]
+                if size * page >= total:
                     break
                 first_page += 1
-            logger.info(f"总共分享了 {n} 个文件夹")
+        except RECOVERABLE_API_ERRORS as e:
+            raise QuarkPanError(
+                f"批量分享中断（pwd_id={pwd_id} 当前目录={first_dir}/{second_dir} "
+                f"已分享 {n} 个，失败 {len(failures)} 个）：{e}"
+            ) from e
 
-        except Exception as e:  # noqa: BLE001 - preserve batch processing behavior
-            logger.error(f"分享失败：{e}")
-            logger.error(f"{first_dir}/{second_dir} 文件夹")
+        logger.info(f"总共分享了 {n} 个文件夹，失败 {len(failures)} 个")
+        return failures
 
     def share_retry(
         self,
@@ -663,7 +800,7 @@ class QuarkPanManage:
         url_type: int = 1,
         expired_type: int = 2,
         password: str = "",
-    ) -> None:
+    ) -> list[str]:
         """根据 `share` 失败时记录的日志行重新尝试分享。
 
         参数:
@@ -672,45 +809,39 @@ class QuarkPanManage:
             url_type: 分享链接类型，`2` 表示带提取码。
             expired_type: 过期类型。
             password: 指定提取码，为空时按 `url_type` 自动生成。
+
+        返回:
+            重试后仍然失败的原始行列表；全部成功时返回空列表。
         """
-        data_list = retry_url.split("\n")
+        error_data: list[str] = []
+        for n, line in enumerate(retry_url.split("\n")):
+            data = line.split(" | ")
+            if len(data) != 4:
+                continue
 
-        error = 0
-        error_data = []
-        for n, i1 in enumerate(data_list):
-            data = i1.split(" | ")
-            if data and len(data) == 4:
-                first_dir = data[-3]
-                second_dir = data[-2]
-                fid = data[-1]
-                share_success = False
-                for i in range(3):
-                    try:
-                        task_id = self.get_share_task_id(
-                            fid,
-                            second_dir,
-                            url_type=url_type,
-                            expired_type=expired_type,
-                            password=password,
-                        )
-                        logger.debug(f"获取到任务ID：{task_id}")
-                        share_id = self.get_share_id(task_id)
-                        logger.debug(f"获取到分享ID：{share_id}")
-                        share_url = self.submit_share(share_id)
-                        logger.info(
-                            f"{n} | {first_dir} | {second_dir} | {_mask_share_url(share_url)}"
-                        )
-                        logger.info(f"{n}.分享成功 {first_dir}/{second_dir} 文件夹")
-                        share_success = True
-                        break
-                    except Exception as e:  # noqa: BLE001 - retry individual share
-                        logger.error(f"分享失败：{e}")
-                        error += 1
+            first_dir = data[-3]
+            second_dir = data[-2]
+            fid = data[-1]
+            try:
+                share_link = self._share_folder_with_retry(
+                    fid,
+                    second_dir,
+                    url_type=url_type,
+                    expired_type=expired_type,
+                    password=password,
+                )
+            except QuarkPanError as e:
+                logger.error(f"分享失败：{e}")
+                error_data.append(line)
+                continue
+            logger.info(
+                f"{n} | {first_dir} | {second_dir} | {_mask_share_url(share_link)}"
+            )
+            logger.info(f"{n}.分享成功 {first_dir}/{second_dir} 文件夹")
 
-                if not share_success:
-                    error_data.append(i1)
-        error_content = "\n".join(error_data)
-        logger.error(error_content)
+        if error_data:
+            logger.error("以下条目重试后仍然失败：\n" + "\n".join(error_data))
+        return error_data
 
     def search_file(
         self,
@@ -785,15 +916,30 @@ class QuarkPanManage:
         data = {"action_type": 2, "filelist": [file_id], "exclude_fids": []}
         return self.request("file/delete", "post", data=data)
 
-    def store(self, url: str) -> None:
+    def store(self, url: str) -> str:
         """转存分享链接指定的单个文件并重新生成分享链接。
 
         参数:
             url: 待转存的分享链接。
+
+        返回:
+            转存后新生成的分享链接。
+
+        异常:
+            QuarkPanError: 分享链接无效、stoken 获取失败、分享内容为空或
+                异步任务未在轮询次数内完成。
         """
         pwd_id = get_id_from_url(url)
+        if not pwd_id:
+            raise QuarkPanError(f"无法从链接中解析 pwd_id：{_mask_share_url(url)}")
         stoken = self.get_stoken(pwd_id)
-        detail = self.get_detail(pwd_id, stoken)[1][0]
+        if not stoken:
+            raise QuarkPanError(f"获取 stoken 失败（pwd_id={pwd_id}）")
+
+        detail_list = self.get_detail(pwd_id, stoken)[1]
+        if not detail_list:
+            raise QuarkPanError(f"分享内容为空（pwd_id={pwd_id}）")
+        detail = detail_list[0]
         file_name = detail.get("title") or detail.get("file_name", "")
 
         first_id, share_fid_token, file_type = (
@@ -803,14 +949,15 @@ class QuarkPanManage:
         )
         task = self.save_task_id(pwd_id, stoken, first_id, share_fid_token)
         data = self.task(task)
-        file_id = data.get("data").get("save_as").get("save_as_top_fids")[0]
+        file_id = data["data"]["save_as"]["save_as_top_fids"][0]
         share_task_id = self.share_task_id(file_id, file_name)
-        share_id = self.task(share_task_id).get("data").get("share_id")
+        share_id = self.task(share_task_id)["data"]["share_id"]
         share_link = self.get_share_link(share_id)
         logger.info(
             f"file_id={file_id} file_name={file_name} file_type={file_type} "
             f"share_link={_mask_share_url(share_link)}"
         )
+        return share_link
 
     def save_task_id(
         self,
@@ -848,25 +995,33 @@ class QuarkPanManage:
         logger.debug(f"获取到转存任务ID：{task_id}")
         return task_id
 
-    def task(self, task_id: str, trice: int = 10) -> Any:
-        """根据 task_id 轮询任务结果。
+    def task(self, task_id: str, trice: int = 10) -> dict[str, Any]:
+        """根据 task_id 轮询任务结果，直到任务完成。
 
         参数:
             task_id: 异步任务 ID。
             trice: 最大轮询次数，默认 10。
 
         返回:
-            任务完成时返回接口的 JSON 结果；超过轮询次数仍未完成则返回 `False`。
+            任务完成（`data.status == 2`）时接口返回的 JSON。
+
+        异常:
+            QuarkPanError: 轮询次数耗尽任务仍未完成。调用方（如 `store`）需要
+                `data.save_as` 才能继续，返回假值只会让后续取字段时炸在别处。
         """
         logger.info("根据TASKID执行任务")
+        status = None
         for i in range(trice):
-            data = {"task_id": task_id, "retry_index": "range"}
-            response = self.request("task", "get", headers=self.headers, data=data)
+            params = {"task_id": task_id, "retry_index": i}
+            response = self.request("task", "get", headers=self.headers, params=params)
             status = response.get("data", {}).get("status")
             logger.debug(f"task_id={task_id} 第{i + 1}次查询，status={status}")
-            if status:
+            if status == TASK_STATUS_DONE:
                 return response
-        return False
+            time.sleep(random.randint(500, 1000) / 1000)
+        raise QuarkPanError(
+            f"任务 task_id={task_id} 轮询 {trice} 次后仍未完成（最后 status={status}）"
+        )
 
     def share_task_id(self, file_id: str, file_name: str) -> str:
         """创建单文件分享任务，返回异步任务 ID。
@@ -896,7 +1051,5 @@ class QuarkPanManage:
         返回:
             分享链接。
         """
-        url = "https://drive-pc.quark.cn/1/clouddrive/share/password?pr=ucpro&fr=pc&uc_param_str="
-        data = {"share_id": share_id}
-        response = requests.post(url=url, json=data, headers=self.headers)
-        return response.json().get("data").get("share_url")
+        response = self.request("share/password", "post", data={"share_id": share_id})
+        return response["data"]["share_url"]

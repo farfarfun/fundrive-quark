@@ -15,6 +15,7 @@ from fundrives.quark.manage import (
     QuarkPanError,
     QuarkPanManage,
     _mask_share_url,
+    _parse_pdir_fid,
     generate_random_code,
     get_datetime,
     get_id_from_url,
@@ -685,3 +686,88 @@ def test_quark_package_ships_py_typed():
 
     package_dir = Path(fundrives.quark.__file__).parent
     assert (package_dir / "py.typed").is_file()
+
+
+# --- 链接/目录解析的失败路径 ----------------------------------------------------
+
+
+def test_get_pwd_id_raises_on_url_without_share_segment():
+    """链接里没有 `/s/` 段时要抛带上下文的领域异常。
+
+    历史缺陷：`share_url.split("?")[0].split("/s/")[1]` 对非法链接抛裸
+    `IndexError`，`save_shared` 的调用方只能看到一句没有任何上下文的报错。
+    """
+    with pytest.raises(QuarkPanError, match="无法从链接中解析 pwd_id"):
+        QuarkPanManage.get_pwd_id("https://pan.quark.cn/list#/list/all")
+
+
+def test_get_pwd_id_raises_on_empty_pwd_id():
+    """`/s/` 后面是空的同样算非法链接。"""
+    with pytest.raises(QuarkPanError, match="无法从链接中解析 pwd_id"):
+        QuarkPanManage.get_pwd_id("https://pan.quark.cn/s/?pwd=ab12")
+
+
+def test_parse_pdir_fid_takes_segment_before_dash():
+    """文件夹网页地址末段形如 `<fid>-<目录名>`，取 `-` 之前的部分。"""
+    assert (
+        _parse_pdir_fid("https://pan.quark.cn/list#/list/all/abc123def-我的资料")
+        == "abc123def"
+    )
+    # 目录名里本身带 `-` 也只切第一个
+    assert _parse_pdir_fid("https://pan.quark.cn/list#/list/all/abc-a-b") == "abc"
+    # 允许直接传裸 fid
+    assert _parse_pdir_fid("abc123def") == "abc123def"
+    # 末尾多余的 `/` 不影响
+    assert _parse_pdir_fid("https://pan.quark.cn/list#/list/all/abc123def-x/") == (
+        "abc123def"
+    )
+
+
+def test_parse_pdir_fid_raises_when_unparsable():
+    """解析不出非空 fid 时要报错，而不是拿一个空串去当目录 ID 翻页。"""
+    with pytest.raises(QuarkPanError, match="无法从文件夹网页地址解析目录 fid"):
+        _parse_pdir_fid("https://pan.quark.cn/list#/list/all/-只有目录名")
+
+
+# --- share 的目录定位 -----------------------------------------------------------
+
+
+def test_share_uses_folder_id_when_given():
+    """`folder_id` 此前声明了却从未被使用；给了就必须优先于 URL 解析。"""
+    drive = _make_manage()
+    empty = {"data": {"list": []}, "metadata": {"_total": 0, "_size": 50, "_page": 1}}
+    with mock.patch.object(drive, "get_file_list", return_value=empty) as get_file_list:
+        failed = drive.share("https://pan.quark.cn/list#/list/all/zzz-x", folder_id="0")
+
+    assert failed == []
+
+    assert get_file_list.call_args.args[0] == "0"
+
+
+def test_share_parses_folder_id_from_url_when_not_given():
+    """没给 `folder_id` 时回落到从文件夹网页地址解析目录 fid。"""
+    drive = _make_manage()
+    empty = {"data": {"list": []}, "metadata": {"_total": 0, "_size": 50, "_page": 1}}
+    with mock.patch.object(drive, "get_file_list", return_value=empty) as get_file_list:
+        drive.share("https://pan.quark.cn/list#/list/all/abc123-我的资料")
+
+    assert get_file_list.call_args.args[0] == "abc123"
+
+
+# --- 接口参数编码 ---------------------------------------------------------------
+
+
+def test_get_file_list_encodes_fetch_total_as_flag():
+    """`_fetch_total` 必须是 "1"/"0"，不能把 Python 的 bool 直接交给 requests。
+
+    requests 会把 `True` 编码成 `_fetch_total=True`，夸克不识别，
+    `metadata._total` 可能缺失，依赖它翻页的 `share()` 就只处理第一页。
+    """
+    drive = _make_manage()
+    with mock.patch.object(drive, "request", return_value={"data": {"list": []}}) as m:
+        drive.get_file_list(fetch_total=True)
+    assert m.call_args.kwargs["params"]["_fetch_total"] == "1"
+
+    with mock.patch.object(drive, "request", return_value={"data": {"list": []}}) as m:
+        drive.get_file_list(fetch_total=False)
+    assert m.call_args.kwargs["params"]["_fetch_total"] == "0"

@@ -4,6 +4,20 @@
 文件夹批量分享等常用能力，供 [fundrive](https://github.com/farfarfun/fundrive)
 及其他项目以统一命名空间接入夸克网盘。
 
+## 环境要求
+
+| 项目 | 要求 |
+|---|---|
+| Python | `>=3.10`（用到 `str \| None` 等原生联合类型写法） |
+| 运行时依赖 | `requests>=2.28`、`farlog>=1.1.7`，随安装自动拉取 |
+| 账号凭据 | 已登录夸克网盘账号的浏览器 Cookie 字符串，必填 |
+| 网络 | 需能直连 `pan.quark.cn` 与 `drive-pc.quark.cn`（调用的是夸克的私有 Web API，非官方开放平台接口） |
+| 系统依赖 | 无，纯 Python |
+
+Cookie 的取法：浏览器登录 <https://pan.quark.cn>，开发者工具 → Network →
+任意一个 `drive-pc.quark.cn` 请求 → 复制请求头里的 `cookie` 整行。
+该 Cookie 等同于账号登录态，**不要写进代码或提交到仓库**，建议走环境变量读取。
+
 ## 安装
 
 本包尚未发布到 PyPI，目前从仓库安装：
@@ -19,8 +33,10 @@ uv add git+https://github.com/farfarfun/fundrive-quark.git
 ```python
 from fundrives.quark import QuarkPanError, QuarkPanManage
 
-# cookies 为已登录夸克网盘账号的浏览器 Cookie 字符串
-drive = QuarkPanManage(cookies="your-cookie-string")
+import os
+
+# cookies 为已登录夸克网盘账号的浏览器 Cookie 字符串，从环境变量读取，不要写死在代码里
+drive = QuarkPanManage(cookies=os.environ["QUARK_COOKIES"])
 
 # 将他人分享的文件转存到自己网盘的根目录
 # 返回 True 表示转存任务确实完成，False 表示被跳过（网盘中已存在、分享为空等）
@@ -31,9 +47,10 @@ file_list = drive.get_file_list(pdir_fid="0")
 for item in file_list["data"]["list"]:
     print(item["file_name"])
 
-# 批量分享：返回失败条目，可直接喂回 share_retry 重试
+# 批量分享：传网盘的文件夹网页地址，末段形如 `<目录fid>-<目录名>`
+# 返回失败条目，可直接喂回 share_retry 重试
 try:
-    failed = drive.share("https://pan.quark.cn/list/#/all-0")
+    failed = drive.share("https://pan.quark.cn/list#/list/all/<目录fid>-<目录名>")
     if failed:
         drive.share_retry("\n".join(failed))
 except QuarkPanError as e:

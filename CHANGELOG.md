@@ -2,6 +2,44 @@
 
 本项目遵循[语义化版本](https://semver.org/lang/zh-CN/)，变更记录按版本倒序排列。
 
+> **发布状态**：本包**从未发布到 PyPI**（`https://pypi.org/pypi/fundrive-quark/json` 返回 404），
+> 下面各版本号只是仓库内部的里程碑标记，不存在任何已对外发布的公开 API 契约，
+> 因此也不存在需要用主版本号保护的线上兼容负担。安装方式见 README。
+
+## [未发布]
+
+### 修复
+
+- `QuarkPanManage.get_pwd_id` 对不含 `/s/` 段的链接抛裸 `IndexError`（原实现
+  `split("/s/")[1]`），调用方拿不到任何上下文；改为抛带原链接的 `QuarkPanError`，
+  与 `store()` 走的 `get_id_from_url` 行为对齐
+- `get_file_list` 把 Python 的 `bool` 直接当 `_fetch_total` 查询参数传给 `requests`，
+  会被编码成 `_fetch_total=True`。夸克接口的开关参数一律是 `"1"`/`"0"`（同文件的
+  `_fetch_sub_dirs`、`_is_hl`、`force` 以及 `search_file` 的 `_fetch_total` 都是），
+  服务端不识别 `True` 时 `metadata._total` 可能缺失，依赖它翻页的 `share()` 就只会
+  处理第一页；改为显式传 `"1"`/`"0"`
+- `share()` 的目录 ID 解析 `share_url.rsplit("/", 1)[1].split("-")[0]` 在地址形状不对时
+  会悄悄算出一个无意义的字符串（甚至空串）拿去当目录 ID 翻页，错得毫无提示；抽成
+  `_parse_pdir_fid()` 并在解析不出非空 fid 时抛 `QuarkPanError`
+- `share()` 的 `folder_id` 参数此前声明了却从未使用（docstring 写着「保留参数」）；
+  现在给了就优先使用，不给才回落到从网页地址解析
+- `store()` 里的 `detail.get("title") or detail.get("file_name", "")`：`get_detail`
+  组装的条目只有 `file_name` 没有 `title`，左分支是永远走不到的死代码，已移除
+
+### 变更
+
+- README 补充「环境要求」小节：Python `>=3.10`、运行时依赖、必需的夸克登录 Cookie
+  及其取法与保密提醒、需直连 `pan.quark.cn` / `drive-pc.quark.cn`、无系统依赖
+- README 快速开始示例改为从环境变量读取 Cookie，不再出现写死凭据的写法；
+  批量分享示例的文件夹地址改成真实形状 `<目录fid>-<目录名>`
+- `uv.lock` 按组织规范不再纳入版本管理，已从仓库移除并保留在 `.gitignore` 中（`9440310`）。
+  `[1.1.0]` / `[1.0.4]` 里关于 `uv.lock` 的记述只反映当时状态，不代表现行做法。
+
+### 测试
+
+- 新增 7 条用例：`get_pwd_id` 的两条失败路径、`_parse_pdir_fid` 的正常/边界/失败路径、
+  `share()` 对 `folder_id` 的优先使用与 URL 回落、`_fetch_total` 的参数编码
+
 ## [1.1.0] - 2026-10-02
 
 ### 修复

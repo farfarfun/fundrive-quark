@@ -114,6 +114,34 @@ def get_datetime(timestamp: float | None = None, fmt: str = "%Y-%m-%d %H:%M:%S")
     return datetime.fromtimestamp(timestamp).astimezone().strftime(fmt)
 
 
+def _parse_pdir_fid(folder_url: str) -> str:
+    """从夸克网盘的文件夹网页地址里解析出目录 fid。
+
+    地址末段形如 `<fid>-<目录名>`（例如
+    `https://pan.quark.cn/list#/list/all/0a1b2c3d4e5f-我的资料`），取第一个
+    `-` 之前的部分；也允许直接传一个裸 fid。
+
+    参数:
+        folder_url: 文件夹网页地址，或直接就是目录 fid。
+
+    返回:
+        目录 fid。
+
+    异常:
+        QuarkPanError: 解析不出非空 fid。原实现是裸的
+            `url.rsplit("/", 1)[1].split("-")[0]`，地址形状不对时会悄悄算出一个
+            无意义的字符串（甚至空串）拿去当目录 ID 翻页，错得毫无提示。
+    """
+    tail = folder_url.split("?", 1)[0].rstrip("/").rsplit("/", maxsplit=1)[-1]
+    pdir_fid = tail.split("-", 1)[0].strip()
+    if not pdir_fid:
+        raise QuarkPanError(
+            f"无法从文件夹网页地址解析目录 fid：{folder_url!r}；"
+            "期望末段形如 `<目录fid>-<目录名>`，或直接传目录 fid"
+        )
+    return pdir_fid
+
+
 def _mask_share_url(url: str) -> str:
     """脱敏分享链接中可能携带的提取码等查询参数，仅用于日志输出。
 
@@ -159,8 +187,18 @@ class QuarkPanManage:
 
         返回:
             提取到的 pwd_id。
+
+        异常:
+            QuarkPanError: 链接里没有 `/s/` 段或 pwd_id 为空。原实现直接
+                `split("/s/")[1]`，非法链接会抛一句没有上下文的 `IndexError`，
+                调用方看不出是链接写错了。
         """
-        return share_url.split("?")[0].split("/s/")[1]
+        head = share_url.split("?", 1)[0]
+        parts = head.split("/s/", 1)
+        pwd_id = parts[1].strip("/") if len(parts) == 2 else ""
+        if not pwd_id:
+            raise QuarkPanError(f"无法从链接中解析 pwd_id：{head}")
+        return pwd_id
 
     @staticmethod
     def extract_urls(text: str) -> str:
@@ -702,8 +740,11 @@ class QuarkPanManage:
         遍历 `share_url` 对应目录下的一级、二级子文件夹并逐个创建分享链接。
 
         参数:
-            share_url: 网盘文件夹网页地址。
-            folder_id: 保留参数，当前实现未使用。
+            share_url: 网盘文件夹网页地址，末段形如 `<目录fid>-<目录名>`
+                （例如 `https://pan.quark.cn/list#/list/all/<fid>-<名称>`）。
+                也可以直接传目录 fid。
+            folder_id: 直接指定要遍历的目录 fid；给了就优先用它，
+                不再从 `share_url` 解析。
             url_type: 分享链接类型，`2` 表示带提取码。
             expired_type: 过期类型。
             password: 指定提取码，为空时按 `url_type` 自动生成。
@@ -713,11 +754,13 @@ class QuarkPanManage:
             可直接作为 `share_retry` 的输入；全部成功时返回空列表。
 
         异常:
-            QuarkPanError: 目录列表获取失败等无法继续的错误，异常信息中带上
-                当前所在目录；不再静默吞掉让调用方以为已全部分享成功。
+            QuarkPanError: 目录 fid 解析不出来，或目录列表获取失败等无法继续的
+                错误，异常信息中带上当前所在目录；不再静默吞掉让调用方以为已
+                全部分享成功。
         """
         logger.info(f"文件夹网页地址：{_mask_share_url(share_url)}")
-        pwd_id = share_url.rsplit("/", maxsplit=1)[1].split("-")[0]
+        # `folder_id` 原先声明了却从未使用；这里让它真正生效，没给才回落到解析 URL。
+        pdir_fid = folder_id or _parse_pdir_fid(share_url)
 
         first_dir = ""
         second_dir = ""
@@ -727,7 +770,7 @@ class QuarkPanManage:
         try:
             while True:
                 json_data = self.get_file_list(
-                    pwd_id, page=first_page, size=50, fetch_total=True
+                    pdir_fid, page=first_page, size=50, fetch_total=True
                 )
                 for i1 in json_data["data"]["list"]:
                     if not i1["dir"]:
@@ -787,7 +830,7 @@ class QuarkPanManage:
                 first_page += 1
         except RECOVERABLE_API_ERRORS as e:
             raise QuarkPanError(
-                f"批量分享中断（pwd_id={pwd_id} 当前目录={first_dir}/{second_dir} "
+                f"批量分享中断（pdir_fid={pdir_fid} 当前目录={first_dir}/{second_dir} "
                 f"已分享 {n} 个，失败 {len(failures)} 个）：{e}"
             ) from e
 
@@ -893,10 +936,14 @@ class QuarkPanManage:
             接口返回的文件列表 JSON。
         """
         params = {
+            # 夸克接口的布尔开关一律用 "1"/"0"（同本文件 `_fetch_sub_dirs`、
+            # `_is_hl`、`force`）。直接把 Python 的 bool 交给 requests 会被编码成
+            # `_fetch_total=True`，服务端不识别，`metadata._total` 可能缺失，
+            # 依赖它翻页的 `share()` 就只会处理第一页。
             "pdir_fid": pdir_fid,
             "_page": page,
             "_size": size,
-            "_fetch_total": fetch_total,
+            "_fetch_total": "1" if fetch_total else "0",
             "_fetch_sub_dirs": "1",
             "_sort": sort,
         }
@@ -940,7 +987,9 @@ class QuarkPanManage:
         if not detail_list:
             raise QuarkPanError(f"分享内容为空（pwd_id={pwd_id}）")
         detail = detail_list[0]
-        file_name = detail.get("title") or detail.get("file_name", "")
+        # `get_detail` 组装的条目只有 file_name，没有 title；原先的
+        # `detail.get("title") or ...` 永远走不到左分支，是死代码。
+        file_name = detail.get("file_name", "")
 
         first_id, share_fid_token, file_type = (
             detail.get("fid"),

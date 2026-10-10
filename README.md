@@ -20,13 +20,30 @@ Cookie 的取法：浏览器登录 <https://pan.quark.cn>，开发者工具 → 
 
 ## 安装
 
-本包尚未发布到 PyPI，目前从仓库安装：
-
 ```bash
-pip install git+https://github.com/farfarfun/fundrive-quark.git
+pip install fundrive-quark
 # 或
-uv add git+https://github.com/farfarfun/fundrive-quark.git
+uv add fundrive-quark
 ```
+
+## 包名与导入路径
+
+| 名字 | 值 |
+|---|---|
+| GitHub 仓库 | `farfarfun/fundrive-quark` |
+| PyPI 发布名 | `fundrive-quark` |
+| 导入路径 | `fundrives.quark` |
+
+发布名与仓库名一致；导入路径里的 `fundrives`（带 `s`，与主包 `fundrive` 不是同一个名字）
+是 `fundrive-alipan`、`fundrive-baidu`、`fundrive-lanzou`、`fundrive-quark` 这组驱动包
+**共用的 PEP 420 隐式命名空间**，每个发布包只占其下一个子目录（本包是 `fundrives/quark/`），
+这样多个驱动可以同时安装、合并到同一个 `fundrives` 命名空间下。
+
+因此 `src/fundrives/` 下**不要**放 `__init__.py`：一旦放了，隐式命名空间会退化成常规包，
+先安装的 wheel 会直接屏蔽其余兄弟驱动。该布局是组织层面的决议
+（见 [farfarfun/todo-list#394](https://github.com/farfarfun/todo-list/issues/394)），
+`tests/test_manage.py` 里的 `test_fundrives_is_pep420_namespace_package` 守住这个契约。
+PEP 561 的 `py.typed` 同理放在 `fundrives/quark/` 而不是共享的命名空间根目录。
 
 ## 快速开始
 
